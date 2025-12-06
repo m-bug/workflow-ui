@@ -1,0 +1,303 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+    <meta charset="UTF-8">
+    <title>Workflow Visualisierung mit Graphviz</title>
+    <script src="https://cdn.jsdelivr.net/npm/viz.js@2.1.2/viz.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/viz.js@2.1.2/full.render.js"></script>
+
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            background: #f4f4f7;
+            padding: 20px;
+        }
+        textarea {
+            width: 100%;
+            font-family: monospace;
+            font-size: 13px;
+            padding: 10px;
+            margin-bottom: 10px;
+        }
+        #inputRaw { height: 200px; }
+        #inputCsv { height: 200px; }
+
+        button {
+            padding: 10px 20px;
+            font-size: 15px;
+            margin-right: 10px;
+        }
+
+        #graph {
+            margin-top: 20px;
+            border: 1px solid #ccc;
+            background: white;
+            padding: 10px;
+        }
+    </style>
+</head>
+<body>
+
+<h2>Workflow Visualisierung (Graphviz)</h2>
+
+<h3>1. Original Definition eingeben:</h3>
+<textarea id="inputRaw">
+start state init
+  action new_item
+      name "New"
+      trans open
+
+transient state open
+  action modify_xy
+      name "Modify"
+      implements user.ctx_action_intf.edit
+      trans open_mod
+
+state open_mod
+  action send_for_review
+      name "Send for Review"
+      trans for_review
+
+autoexec state for_review
+  action reject
+      name "Reject"
+      trans rejected
+
+  action approve
+      name "Approve"
+      trans done
+
+end state done
+  action finish
+      name "Finish"
+      trans done
+</textarea>
+
+<button onclick="transpile()">Transpilieren → CSV</button>
+
+<h3>2. Transpilierte Version:</h3>
+<textarea id="inputCsv"></textarea>
+
+<button onclick="renderGraph()">Graph aktualisieren</button>
+
+<button onclick="downloadPNG()">Download PNG</button>
+
+
+<div id="graph"></div>
+
+<script>
+/* ----------------------------------------------------------
+   Parser Version 3
+   - Action name from `name "..."` inside action block
+   - Supports: start state, state, autoexec state, end state,
+               transient state (treated as normal state)
+   - Tracks state type for visualization
+---------------------------------------------------------- */
+function transpileWorkflowV3(raw) {
+    const lines = raw.split("\n");
+
+    let currentState = null;
+    let currentStateType = "normal";
+    let currentActionId = null;
+    let currentActionName = null;
+    let inAction = false;
+
+    const result = [];
+    const nodeTypes = {}; // stateName → type
+
+    for (let line of lines) {
+        let l = line.trim();
+        if (!l) continue;
+
+        if (l.startsWith("--")) continue;
+
+        let m;
+
+        m = l.match(/^start state\s+([a-zA-Z0-9_]+)/);
+        if (m) {
+            currentState = m[1];
+            currentStateType = "start";
+            nodeTypes[currentState] = currentStateType;
+            inAction = false;
+            continue;
+        }
+
+        m = l.match(/^state\s+([a-zA-Z0-9_]+)/);
+        if (m) {
+            currentState = m[1];
+            currentStateType = "normal";
+            nodeTypes[currentState] = currentStateType;
+            inAction = false;
+            continue;
+        }
+
+        m = l.match(/^autoexec state\s+([a-zA-Z0-9_]+)/);
+        if (m) {
+            currentState = m[1];
+            currentStateType = "autoexec";
+            nodeTypes[currentState] = currentStateType;
+            inAction = false;
+            continue;
+        }
+
+        m = l.match(/^end state\s+([a-zA-Z0-9_]+)/);
+        if (m) {
+            currentState = m[1];
+            currentStateType = "end";
+            nodeTypes[currentState] = currentStateType;
+            inAction = false;
+            continue;
+        }
+
+        m = l.match(/^transient state\s+([a-zA-Z0-9_]+)/);
+        if (m) {
+            currentState = m[1];
+            currentStateType = "normal";
+            nodeTypes[currentState] = currentStateType;
+            inAction = false;
+            continue;
+        }
+
+        m = l.match(/^action\s+([a-zA-Z0-9_]+)/);
+        if (m) {
+            currentActionId = m[1];
+            currentActionName = null;
+            inAction = true;
+            continue;
+        }
+
+        if (inAction) {
+            m = l.match(/^name\s+"([^"]+)"/);
+            if (m) {
+                currentActionName = m[1];
+                continue;
+            }
+        }
+
+        if (inAction) {
+            m = l.match(/^trans\s+([a-zA-Z0-9_\.]+)/);
+            if (m) {
+                let target = m[1].replace(/.*\./, "");
+                const action = currentActionName ? currentActionName : currentActionId;
+                result.push({
+                    state: currentState,
+                    action: action,
+                    nextState: target
+                });
+                if (!nodeTypes[target]) nodeTypes[target] = "normal";
+                continue;
+            }
+        }
+    }
+
+    return {
+        csv: result.map(t => `${t.state},${t.action},${t.nextState}`).join("\n"),
+        nodeTypes
+    };
+}
+
+function transpile() {
+    const raw = document.getElementById("inputRaw").value;
+    const res = transpileWorkflowV3(raw);
+    document.getElementById("inputCsv").value = res.csv;
+    window.nodeTypes = res.nodeTypes;
+}
+
+/* ----------------------------------------------------------
+   CSV → Graph Visualisierung
+---------------------------------------------------------- */
+function parseCsv(text) {
+    return text
+        .split("\n")
+        .map(l => l.trim())
+        .filter(l => l.length > 0)
+        .map(l => {
+            const parts = l.split(",");
+            return {
+                state: parts[0],
+                action: parts[1],
+                nextState: parts[2]
+            };
+        });
+}
+
+function generateDOT(transitions, nodeTypes) {
+    let dot = "digraph workflow {\n";
+    dot += '  rankdir=LR;\n';
+
+    const nodes = new Set();
+    transitions.forEach(t => {
+        nodes.add(t.state);
+        nodes.add(t.nextState);
+    });
+
+    nodes.forEach(n => {
+        const type = nodeTypes[n] || "normal";
+        let color = "#8e44ad";   // default lila
+        let shape = "circle";     // default
+
+        if (type === "autoexec") { color = "#13259C";}
+        if (type === "end") { color = "#27ae60"; shape = "doublecircle"; }
+        if (type === "start") { color = "#3498db"; shape = "doublecircle"; }
+
+        dot += `  "${n}" [label="${n}", style=filled, color="${color}", shape=${shape}, fontcolor=white];\n`;
+    });
+
+    transitions.forEach(t => {
+        dot += `  "${t.state}" -> "${t.nextState}" [label="${t.action}"];\n`;
+    });
+
+    dot += "}";
+    return dot;
+}
+
+async function renderGraph() {
+    const transitions = parseCsv(document.getElementById("inputCsv").value);
+    const dot = generateDOT(transitions, window.nodeTypes || {});
+    const viz = new Viz();
+
+    try {
+        const svg = await viz.renderSVGElement(dot);
+        const container = document.getElementById("graph");
+        container.innerHTML = "";
+        container.appendChild(svg);
+    } catch (e) {
+        alert("Fehler beim Rendern: " + e.message);
+    }
+}
+
+async function downloadPNG() {
+    const transitions = parseCsv(document.getElementById("inputCsv").value);
+    const dot = generateDOT(transitions, window.nodeTypes || {});
+    const viz = new Viz();
+
+    try {
+        // PNG-Rendering (richtige Methode)
+        const img = await viz.renderImageElement(dot, { format: "png" });
+
+        // img.src ist bereits ein Blob-URL der Form "blob:<uuid>"
+        const url = img.src;
+
+        // Download-Link erstellen
+        const a = document.createElement("a");
+        a.href = url;
+        a.download = "workflow.png";
+        document.body.appendChild(a);
+        a.click();
+        a.remove();
+
+    } catch (e) {
+        alert("Fehler beim PNG Export: " + e.message);
+    }
+}
+
+
+
+// Initial render
+transpile();
+renderGraph();
+</script>
+
+</body>
+</html>
+
